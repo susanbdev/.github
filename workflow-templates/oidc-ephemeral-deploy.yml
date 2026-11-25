@@ -78,7 +78,7 @@ jobs:
       - name: Exchange OIDC token for ephemeral lease and deploy
         run: |
           python3 - <<'PY'
-          import json, os, re, ssl, stat, subprocess, urllib.parse, urllib.request
+          import json, os, re, signal, ssl, stat, subprocess, urllib.parse, urllib.request
 
           ttl = int(os.environ["OIDC_LEASE_TTL_SECONDS"])
           if ttl <= 0 or ttl > 900:
@@ -94,23 +94,36 @@ jobs:
           if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or not os.access(deploy_bin, os.X_OK):
               raise SystemExit(f"{deploy_bin} must be a non-symlink executable regular file")
 
-          req_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise urllib.error.HTTPError(req.full_url, code, "redirects forbidden", headers, fp)
+
+          def require_https(url: str, label: str) -> str:
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                  raise SystemExit(f"{label} must be an credential-free https:// URL")
+              return url
+
+          req_url = require_https(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"], "ACTIONS_ID_TOKEN_REQUEST_URL")
+          ex_url = require_https(os.environ["OIDC_EXCHANGE_URL"], "OIDC_EXCHANGE_URL")
+          rev_url = require_https(os.environ["OIDC_REVOKE_URL"], "OIDC_REVOKE_URL")
           req_tok = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
           aud = urllib.parse.quote(os.environ["OIDC_AUDIENCE"], safe="")
           sep = "&" if "?" in req_url else "?"
           ctx = ssl.create_default_context()
+          opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), NoRedirect())
 
           id_req = urllib.request.Request(
               f"{req_url}{sep}audience={aud}",
               headers={"Authorization": f"Bearer {req_tok}", "Accept": "application/json"},
           )
-          with urllib.request.urlopen(id_req, timeout=10, context=ctx) as resp:
-              oidc_jwt = json.loads(resp.read().decode("ascii"))["value"]
+          with opener.open(id_req, timeout=10) as resp:
+              oidc_jwt = json.loads(resp.read(65536).decode("ascii"))["value"]
 
           repo_name = os.environ.get("GITHUB_REPOSITORY", "")
           body = json.dumps({"ttl_secs": ttl, "repository": repo_name}).encode("ascii")
           ex_req = urllib.request.Request(
-              os.environ["OIDC_EXCHANGE_URL"],
+              ex_url,
               data=body,
               headers={
                   "X-TL-OIDC-Token": oidc_jwt,
@@ -119,8 +132,8 @@ jobs:
               },
               method="POST",
           )
-          with urllib.request.urlopen(ex_req, timeout=20, context=ctx) as resp:
-              vended = json.loads(resp.read().decode("ascii"))
+          with opener.open(ex_req, timeout=20) as resp:
+              vended = json.loads(resp.read(65536).decode("ascii"))
 
           lease_token = (vended.get("account_token") or vended.get("token") or "").strip()
           acct_tok_id = (vended.get("account_token_id") or vended.get("token_id") or "").strip()
@@ -143,29 +156,50 @@ jobs:
               "expires_on": expires_on,
               "revoke_handle": revoke_handle,
           }
+          child_holder = {"proc": None}
+
+          def handle_cancel(signum, _frame):
+              proc = child_holder["proc"]
+              if proc is not None and proc.poll() is None:
+                  proc.terminate()
+              raise SystemExit(128 + signum)
+
+          signal.signal(signal.SIGTERM, handle_cancel)
+          signal.signal(signal.SIGINT, handle_cancel)
           try:
-              subprocess.run(
+              proc = subprocess.Popen(
                   [deploy_bin, "--token-stdin"],
-                  input=(lease_token + "\n").encode("ascii"),
-                  check=True,
+                  stdin=subprocess.PIPE,
               )
+              child_holder["proc"] = proc
+              proc.communicate(input=(lease_token + "\n").encode("ascii"))
+              if proc.returncode != 0:
+                  raise SystemExit(proc.returncode)
           finally:
               rev_body = json.dumps(rev_payload).encode("ascii")
               rev_req = urllib.request.Request(
-                  os.environ["OIDC_REVOKE_URL"],
+                  rev_url,
                   data=rev_body,
                   headers={"Content-Type": "application/json", "Accept": "application/json"},
                   method="DELETE",
               )
-              with urllib.request.urlopen(rev_req, timeout=20, context=ctx) as rev_resp:
-                  rev_resp.read()
+              with opener.open(rev_req, timeout=20) as rev_resp:
+                  rev_resp.read(65536)
           PY
 
       - name: Verify zero residual OIDC lease artifacts
         if: always()
         run: |
           python3 - <<'PY'
-          import os
-          if "OIDC_LEASE_TOKEN" in os.environ:
-              raise SystemExit("Plaintext OIDC_LEASE_TOKEN leaked into ambient environment")
+          import os, subprocess
+          forbidden_env = ("OIDC_LEASE_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "OIDC_REVOKE_HANDLE")
+          leaked = [k for k in forbidden_env if os.environ.get(k)]
+          if leaked:
+              raise SystemExit(f"Plaintext credential leaked into ambient environment: {leaked}")
+          untracked = subprocess.check_output(
+              ["git", "ls-files", "--others", "--exclude-standard"], text=True
+          ).splitlines()
+          bad_files = [f for f in untracked if any(tok in f.lower() for tok in ("lease", "token", "secret", ".pem", ".key"))]
+          if bad_files:
+              raise SystemExit(f"Residual untracked credential artifact detected: {bad_files}")
           PY

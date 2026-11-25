@@ -136,10 +136,10 @@ def verify_sshsig(payload: bytes, armored: str, allowed_pubkey_hex: str | None =
     pinned = (
         allowed_pubkey_hex
         if allowed_pubkey_hex is not None
-        else (os.environ.get("ALLOWED_SK_PUBKEY_HEX") or OWNER_SK_ED25519_PUBKEY_HEX)
+        else OWNER_SK_ED25519_PUBKEY_HEX
     ).strip().lower()
     if len(pinned) != 64 or any(ch not in "0123456789abcdef" for ch in pinned):
-        raise ValueError("ALLOWED_SK_PUBKEY_HEX must be a 64-char lowercase hex Ed25519 public key")
+        raise ValueError("pinned Ed25519 public key must be 64-char lowercase hex")
     if not hmac.compare_digest(pubkey_raw.hex(), pinned):
         raise ValueError("signer public key is not enrolled in OWNER_SK_ED25519_PUBKEY_HEX")
 
@@ -276,12 +276,19 @@ def run_self_test() -> int:
     except ValueError:
         pass
 
+    prev_env_pk = os.environ.get("ALLOWED_SK_PUBKEY_HEX")
+    os.environ["ALLOWED_SK_PUBKEY_HEX"] = valid_pub
     try:
         p, s = extract_tag_sig(valid_tag, expected_tag="v1.2.3")
         verify_sshsig(p, s)
-        raise SystemExit("self-test failed to reject un-enrolled sk-ssh-ed25519 key")
+        raise SystemExit("self-test failed to reject un-enrolled sk-ssh-ed25519 key under ambient ALLOWED_SK_PUBKEY_HEX")
     except ValueError:
         pass
+    finally:
+        if prev_env_pk is None:
+            os.environ.pop("ALLOWED_SK_PUBKEY_HEX", None)
+        else:
+            os.environ["ALLOWED_SK_PUBKEY_HEX"] = prev_env_pk
 
     for bad_flags in (0x00, 0x01, 0x04):
         bad_fl_armor, bad_fl_pub = build_test_sk_armor(bytes(range(32)), tag_payload, b"ssh:", bad_flags, b"git")
