@@ -1,0 +1,206 @@
+#!/bin/sh
+set -eu
+
+sh -n ./scripts/check ./scripts/verify-release-tag-sshsig.sh ./scripts/sign-head-sshsig.sh
+
+exec python3 - "$@" <<'PY'
+import json, os, pathlib, re, stat, subprocess, sys
+
+ROOT = pathlib.Path.cwd().resolve()
+REQUIRED_FILES = [
+    "AGENTS.md", "SECURITY.md", "LICENSE", "README.md", "Makefile", "profile/README.md",
+    ".github/workflows/ci.yml", "scripts/check", "scripts/verify-release-tag-sshsig.sh", "scripts/sign-head-sshsig.sh",
+    "workflow-templates/zero-trust-check.yml", "workflow-templates/zero-trust-check.properties.json",
+    "workflow-templates/oidc-ephemeral-deploy.yml", "workflow-templates/oidc-ephemeral-deploy.properties.json",
+]
+FORBIDDEN_AUTHORITY = {"AGENTS.md", "CLAUDE.md", ".cursorrules"}
+NOISE_DIRS = {"utils", "helpers", "common", "misc", "tmp", ".tmp", ".cache", "node_modules", "vendor", ".venv"}
+FORBIDDEN_WF_TOKENS = [
+    "workflow_" + "run", "workflow_" + "call", "repository_" + "dispatch", "gh workflow " + "run",
+    "/dispatches", "/.github/workflows/", "secrets.", "write-all", "persist-credentials: true",
+    "--no-verify", "GITHUB_ENV",
+]
+REQUIRED_GITCONFIG_TOKENS = [
+    "hooksPath = /dev/null", "attributesFile = /dev/null", "fsmonitor = false",
+    "symlinks = false", "protectHFS = true", "protectNTFS = true",
+    "allow = never", "fsckObjects = true", "recurse = false",
+]
+SHA_PIN_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
+
+
+def fail(msg: str) -> None:
+    print(f"[CHECK FAIL] {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_regular_nofollow(rel: str) -> bytes:
+    parts = pathlib.PurePosixPath(rel).parts
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        fail(f"invalid relative path: {rel}")
+    cur = ROOT
+    for idx, part in enumerate(parts):
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except OSError as exc:
+            fail(f"missing path {rel}: {exc}")
+        if stat.S_ISLNK(st.st_mode):
+            fail(f"symlink forbidden at {cur.relative_to(ROOT)}")
+        if idx + 1 < len(parts) and not stat.S_ISDIR(st.st_mode):
+            fail(f"non-directory ancestor at {cur.relative_to(ROOT)}")
+        if idx + 1 == len(parts) and not stat.S_ISREG(st.st_mode):
+            fail(f"expected regular file at {rel}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(cur, flags)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            blk = os.read(fd, 65536)
+            if not blk:
+                break
+            chunks.append(blk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def list_repo_files() -> list[str]:
+    out = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard"], text=True)
+    return sorted(line for line in out.splitlines() if line)
+
+
+def audit_files(files: list[str]) -> None:
+    for req in REQUIRED_FILES:
+        raw_req = read_regular_nofollow(req)
+        if len(raw_req) == 0:
+            fail(f"empty required file: {req}")
+    if len(read_regular_nofollow("AGENTS.md")) > 16384:
+        fail("AGENTS.md exceeds 16 KiB ceiling")
+    for script in ("scripts/check", "scripts/verify-release-tag-sshsig.sh", "scripts/sign-head-sshsig.sh"):
+        read_regular_nofollow(script)
+        if not os.access(ROOT / script, os.X_OK):
+            fail(f"{script} is not executable")
+
+    for rel in files:
+        parts = pathlib.PurePosixPath(rel).parts
+        if any(part in NOISE_DIRS or part.startswith(".env") for part in parts):
+            fail(f"forbidden directory or env file present: {rel}")
+        if rel != "AGENTS.md" and parts[-1] in FORBIDDEN_AUTHORITY:
+            fail(f"nested or competing authority file forbidden: {rel}")
+        if rel == ".github/copilot-instructions.md" or rel.endswith(".svg"):
+            fail(f"forbidden asset or instructions file: {rel}")
+
+        raw = read_regular_nofollow(rel)
+        for idx, b in enumerate(raw):
+            if not (b in (9, 10) or 32 <= b <= 126):
+                fail(f"{rel}: non-7-bit-printable ASCII byte 0x{b:02x} at offset {idx}")
+
+        if rel.endswith((".js", ".mjs", ".cjs")):
+            sloc = sum(1 for ln in raw.decode("ascii").splitlines() if ln.strip())
+            if sloc > 150:
+                fail(f"{rel}: JS/MJS SLOC {sloc} exceeds 150 ceiling")
+
+
+def audit_workflow_yaml(rel: str) -> None:
+    text = read_regular_nofollow(rel).decode("ascii")
+    for tok in FORBIDDEN_WF_TOKENS:
+        if tok in text:
+            fail(f"{rel}: contains forbidden workflow token '{tok}'")
+    for req_git in REQUIRED_GITCONFIG_TOKENS:
+        if req_git not in text:
+            fail(f"{rel}: missing hardened gitconfig setting '{req_git}'")
+    if re.search(r"\b(curl|wget)\b", text) or "git -c" in text:
+        fail(f"{rel}: contains forbidden curl/wget or 'git -c' invocation")
+    if "permissions:" not in text or "contents: read" not in text:
+        fail(f"{rel}: missing explicit least-privilege 'permissions: contents: read'")
+    for perm_match in re.finditer(r"^\s*([a-z-]+):\s*(read|write|none)\s*$", text, re.M):
+        scope, level = perm_match.group(1), perm_match.group(2)
+        if level == "write" and scope != "id-token":
+            fail(f"{rel}: forbidden write permission '{scope}: write'")
+
+    uses = [m.group(1).strip() for m in re.finditer(r"^\s*-?\s*uses:\s*([^\s#]+)", text, re.M)]
+    if not uses:
+        fail(f"{rel}: expected at least one SHA-pinned 'uses:' step")
+    for target in uses:
+        if not SHA_PIN_RE.fullmatch(target):
+            fail(f"{rel}: unpinned action '{target}' (40-lowercase-hex SHA required)")
+    checkouts = sum(1 for u in uses if u.startswith("actions/checkout@"))
+    persists = len(re.findall(r"^\s*persist-credentials:\s*false\s*$", text, re.M))
+    if checkouts == 0 or persists < checkouts:
+        fail(f"{rel}: every actions/checkout step must set 'persist-credentials: false'")
+
+
+def audit_templates(files: list[str]) -> None:
+    wf_files = [f for f in files if (f.startswith(".github/workflows/") or f.startswith("workflow-templates/")) and f.endswith((".yml", ".yaml"))]
+    for wf in wf_files:
+        audit_workflow_yaml(wf)
+
+    for ci_rel in (".github/workflows/ci.yml", "workflow-templates/zero-trust-check.yml"):
+        ci_text = read_regular_nofollow(ci_rel).decode("ascii")
+        if '"shadow/**"' not in ci_text or '"v*"' not in ci_text or "name: shadow/verify" not in ci_text:
+            fail(f"{ci_rel}: must trigger on shadow/** and v* tags and emit job name 'shadow/verify'")
+        if "--verify-release-tag" not in ci_text or "--verify-sshsig" in ci_text:
+            fail(f"{ci_rel}: must gate refs/tags/v* with --verify-release-tag and forbid HEAD --verify-sshsig")
+
+    oidc_text = read_regular_nofollow("workflow-templates/oidc-ephemeral-deploy.yml").decode("ascii")
+    if "id-token: write" not in oidc_text or 'OIDC_LEASE_TTL_SECONDS: "900"' not in oidc_text or "if: always()" not in oidc_text:
+        fail("workflow-templates/oidc-ephemeral-deploy.yml: missing OIDC lease TTL <= 900s or mandatory post-step check")
+    if "--verify-sshsig" in oidc_text:
+        fail("workflow-templates/oidc-ephemeral-deploy.yml: must not require human SSHSIG on commits")
+
+    tpl_yml = {pathlib.PurePosixPath(f).stem for f in files if f.startswith("workflow-templates/") and f.endswith(".yml")}
+    tpl_props = [f for f in files if f.startswith("workflow-templates/") and f.endswith(".properties.json")]
+    if tpl_yml != {pathlib.PurePosixPath(f[:-len(".properties.json")]).name for f in tpl_props}:
+        fail("workflow-templates/*.yml and *.properties.json stems must match 1-to-1")
+
+    for prop_rel in tpl_props:
+        data = json.loads(read_regular_nofollow(prop_rel).decode("ascii"))
+        for key in ("name", "description", "iconName"):
+            if not isinstance(data.get(key), str) or not data[key].strip():
+                fail(f"{prop_rel}: missing non-empty string '{key}'")
+        icon = data["iconName"].lower()
+        if ".svg" in icon or "<svg" in icon or "data:" in icon:
+            fail(f"{prop_rel}: iconName must not reference or embed SVG data")
+        if not isinstance(data.get("categories"), list) or not data["categories"]:
+            fail(f"{prop_rel}: 'categories' must be a non-empty list")
+
+
+def parse_args(argv: list[str]) -> str | None:
+    release_tag: str | None = None
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--verify-release-tag":
+            if idx + 1 >= len(argv) or not argv[idx + 1]:
+                fail("--verify-release-tag requires an annotated v* release tag argument")
+            release_tag = argv[idx + 1]
+            idx += 2
+        elif arg.startswith("--verify-release-tag="):
+            val = arg.split("=", 1)[1]
+            if not val:
+                fail("--verify-release-tag requires an annotated v* release tag argument")
+            release_tag = val
+            idx += 1
+        else:
+            fail(f"unknown argument: {arg} (supported: --verify-release-tag <vX.Y.Z>)")
+    if release_tag is None and os.environ.get("GITHUB_REF", "").startswith("refs/tags/v"):
+        release_tag = os.environ["GITHUB_REF"]
+    return release_tag
+
+
+def main(argv: list[str]) -> int:
+    release_tag = parse_args(argv)
+    files = list_repo_files()
+    audit_files(files)
+    audit_templates(files)
+    subprocess.run(["./scripts/verify-release-tag-sshsig.sh", "--self-test"], check=True)
+    subprocess.run(["./scripts/sign-head-sshsig.sh", "--self-test"], check=True)
+    if release_tag is not None:
+        subprocess.run(["./scripts/verify-release-tag-sshsig.sh", "--verify", release_tag], check=True)
+    print(f"[OK] susanbdev/.github checks passed ({len(files)} files verified, 7-bit ASCII, no-follow, SHA-pinned OIDC templates clean)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+PY

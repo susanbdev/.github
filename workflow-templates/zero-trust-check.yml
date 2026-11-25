@@ -1,0 +1,80 @@
+name: Zero-Trust Check
+
+on:
+  push:
+    branches:
+      - main
+      - "shadow/**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zt-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: shadow/verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Git configuration
+        run: |
+          cat <<'EOF' > "$HOME/.gitconfig"
+          [core]
+          	hooksPath = /dev/null
+          	attributesFile = /dev/null
+          	fsmonitor = false
+          	pager = cat
+          	symlinks = false
+          	autocrlf = input
+          	protectHFS = true
+          	protectNTFS = true
+          [gc]
+          	auto = 0
+          [protocol]
+          	allow = never
+          [protocol "https"]
+          	allow = always
+          [protocol "file"]
+          	allow = never
+          [protocol "ext"]
+          	allow = never
+          [protocol "git"]
+          	allow = never
+          [submodule]
+          	recurse = false
+          	fetchJobs = 0
+          [transfer]
+          	fsckObjects = true
+          [fetch]
+          	fsckObjects = true
+          [receive]
+          	fsckObjects = true
+          [filter "lfs"]
+          	process =
+          	clean =
+          	smudge =
+          	required = false
+          EOF
+
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Run verification gate
+        run: |
+          if [ "${GITHUB_REF#refs/tags/v}" != "${GITHUB_REF}" ]; then
+            ./scripts/check --verify-release-tag "${GITHUB_REF}"
+          else
+            ./scripts/check
+          fi
