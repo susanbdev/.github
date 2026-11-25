@@ -1,0 +1,13 @@
+{
+  "name": "susanbdev Zero-Trust Check",
+  "description": "SHA-pinned checkout with persist-credentials disabled, hardened ~/.gitconfig, read-only GITHUB_TOKEN, deterministic ./scripts/check verification, and FIDO2 SSHSIG verification exclusively on annotated v* release tags.",
+  "iconName": "octicon shield-lock",
+  "categories": [
+    "Continuous Integration",
+    "Security"
+  ],
+  "filePatterns": [
+    "^AGENTS\\.md$",
+    "^Makefile$"
+  ]
+}

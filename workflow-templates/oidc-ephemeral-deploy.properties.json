@@ -1,0 +1,13 @@
+{
+  "name": "susanbdev OIDC Ephemeral Deploy",
+  "description": "Zero-static-secret OIDC deployment starter template with SHA-pinned checkout, TTL <= 900s capability lease exchange, stdin-piped token delivery, and mandatory post-step lease revocation.",
+  "iconName": "octicon key",
+  "categories": [
+    "Deployment",
+    "Security"
+  ],
+  "filePatterns": [
+    "^AGENTS\\.md$",
+    "^scripts/check$"
+  ]
+}
